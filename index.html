@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Semantic VAD Demo</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+    #status { font-size: 1.2em; margin: 20px; }
+    button { padding: 15px 30px; font-size: 1.1em; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Semantic VAD Demo</h1>
+  <button id="startBtn">Start Listening</button>
+  <div id="log"></div>
+  <script type="module">
+    import {env} from "https://cdn.jsdelivr.net/npm/@xenova/transformers/dist/transformers.min.js"; env.localModelPath = "./";
+    import {SileroVADStream, SmartTurnV3} from './js/package.js';
+
+    const SAMPLE_RATE = 16000;
+    const CHUNK_SAMPLES = 2048;
+    const MIN_ACTIVE_FRAMES = 2; // Half a chunk, a frame is 512 samples.
+    const MIN_ACTIVE_CHUNKS = 2;
+    const MAX_SILENCE_CHUNKS = 8;
+    const MAX_BUFFER_SAMPLES = 128000 + 1024; // 63 chunks
+
+    let STREAM_VAD = null;
+    let SEMANTIC_VAD = null;
+    let APPLIED = false;
+
+    let AUDIO_SAMPLES = new Float32Array(0);
+    let CHUNK_ACTIVES = []; // EACH ELEMENT IS VAD OF A CHUNK - 1 or 0, 1 if ACTIVE_SAMPLES >= MIN_ACTIVE_SAMPLES
+
+    // ==================== LOAD MODEL ====================
+    async function initPipeline() {
+      STREAM_VAD = await SileroVADStream.fromFile("./models/silero-vad.onnx");
+      SEMANTIC_VAD = await SmartTurnV3.fromFile("./models/smart-turn-v3.2-cpu.onnx", "./models/whisper-pad-right");
+    }
+
+    // ==================== MAIN AUDIO CALLBACK ====================
+    // Called on the main thread whenever the worklet posts a buffer of samples.
+    async function audioProcess(newSamples) {
+      let currentSamples = new Float32Array(AUDIO_SAMPLES.length + newSamples.length);
+      currentSamples.set(AUDIO_SAMPLES, 0);
+      currentSamples.set(newSamples, AUDIO_SAMPLES.length);
+      if (currentSamples.length > MAX_BUFFER_SAMPLES) {
+        currentSamples = currentSamples.subarray(currentSamples.length - MAX_BUFFER_SAMPLES);
+      }
+      AUDIO_SAMPLES = currentSamples;
+
+      let activeProbs = await STREAM_VAD(newSamples);
+      let frameActives = activeProbs.map(x => (!!(x > 0.5)));
+      let active = frameActives.reduce((acc, val) => acc + val, 0);
+
+      CHUNK_ACTIVES.push(!!(active > MIN_ACTIVE_FRAMES));
+      if (CHUNK_ACTIVES.length > Math.round(MAX_BUFFER_SAMPLES/CHUNK_SAMPLES)){
+        CHUNK_ACTIVES.shift();
+      }
+      active = CHUNK_ACTIVES.reduce((acc, val) => acc + val, 0);
+      /* 
+        Run Semantic-VAD when ALL conditions below are satisfied:
+
+        1) The number of active chunks ≥ MIN_ACTIVE_CHUNKS
+        2) Either:
+           - The current chunk is inactive, OR
+           - The trailing inactive duration ≤ 0.2 s (3200 samples)
+        3) Semantic-VAD has not already been executed for these active chunks.
+
+        Notes:
+        - Currently, only the first condition in (2) is implemented (the current chunk must be inactive).
+        - Otherwise, continue accumulating audio until the maximum silence threshold is reached, then force the turn to end.
+      */ 
+      if(active < MIN_ACTIVE_CHUNKS){
+        log(`Not enough active chunks - ${active}/${MIN_ACTIVE_CHUNKS}.`);
+        return;
+      }
+
+      if(CHUNK_ACTIVES[-1]){
+        APPLIED = false;
+      } 
+
+      let silence_chunks = 0;
+      for(let i = CHUNK_ACTIVES.length - 1; i >= 0; i--){
+        if(CHUNK_ACTIVES[i] == 1){
+          break;
+        }
+        silence_chunks += 1;
+      }
+      
+      if(silence_chunks == 0){
+        log(`Still speaking, waiting...`);
+        return;
+      }
+      if(silence_chunks > MAX_SILENCE_CHUNKS){
+        AUDIO_SAMPLES = new Float32Array(0);
+        CHUNK_ACTIVES = [];
+        consoleLog("End of turn detected by silence.");
+        log("End of turn detected by silence.");
+      }
+
+      if(!APPLIED){
+        APPLIED = true;
+        let prob = await SEMANTIC_VAD(AUDIO_SAMPLES);
+        if(prob > 0.5){
+          AUDIO_SAMPLES = new Float32Array(0);
+          CHUNK_ACTIVES = [];
+          consoleLog(`End of turn detected with probability=${prob.toFixed(4)}.`);
+          log(`End of turn detected with probability=${prob.toFixed(4)}.`);
+        }
+        else{
+          log(`Not end of turn, probability=${prob.toFixed(4)}.`);
+          console.log(AUDIO_SAMPLES);
+        }
+      }
+    }
+
+    // ==================== AUDIO WORKLET PROCESSOR (inlined as Blob) ====================
+    // Runs on the dedicated audio rendering thread.
+    // Accumulates samples into a fixed-size buffer, then transfers them
+    // to the main thread via postMessage (zero-copy with Transferable).
+    const WORKLET_CODE = `
+      class BufferingProcessor extends AudioWorkletProcessor {
+        constructor(options) {
+          super();
+          this._bufferSize = (options.processorOptions && options.processorOptions.bufferSize) || 4096;
+          this._buffer = new Float32Array(this._bufferSize);
+          this._filled = 0;
+        }
+
+        process(inputs) {
+          // inputs[0][0] = first input, first (mono) channel
+          const channel = inputs[0] && inputs[0][0];
+          if (!channel) return true;
+
+          let offset = 0;
+          while (offset < channel.length) {
+            const room = this._bufferSize - this._filled;
+            const chunk = Math.min(room, channel.length - offset);
+            this._buffer.set(channel.subarray(offset, offset + chunk), this._filled);
+            this._filled += chunk;
+            offset += chunk;
+
+            if (this._filled === this._bufferSize) {
+              // Transfer the buffer to the main thread (zero-copy)
+              this.port.postMessage(this._buffer.buffer, [this._buffer.buffer]);
+              // Allocate a fresh buffer for the next round
+              this._buffer = new Float32Array(this._bufferSize);
+              this._filled = 0;
+            }
+          }
+          return true; // keep processor alive
+        }
+      }
+      registerProcessor('buffering-processor', BufferingProcessor);
+    `;
+
+    // ==================== START MICROPHONE ====================
+    async function startListening() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            sampleRate: 16000,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+          }
+        });
+
+        const audioContext = new AudioContext({ sampleRate: 16000 });
+        console.log("AudioContext sample rate:", audioContext.sampleRate);
+
+        // Register the worklet from an inline Blob so no extra file is needed.
+        const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+        const workletUrl = URL.createObjectURL(blob);
+        await audioContext.audioWorklet.addModule(workletUrl);
+        URL.revokeObjectURL(workletUrl); // clean up
+
+        const source = audioContext.createMediaStreamSource(stream);
+
+        const workletNode = new AudioWorkletNode(audioContext, 'buffering-processor', {
+          processorOptions: { bufferSize: CHUNK_SAMPLES },
+          // One input, one output channel (output goes nowhere – we only read)
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+        });
+
+        // Receive buffered samples on the main thread
+        workletNode.port.onmessage = (event) => {
+          // event.data is the transferred ArrayBuffer; wrap it in Float32Array
+          const samples = new Float32Array(event.data);
+          audioProcess(samples);
+        };
+
+        // source → worklet (no need to connect worklet to destination;
+        // connecting to destination just prevents the context from silencing
+        // the node due to the browser's "no audible output" optimisation)
+        source.connect(workletNode);
+        workletNode.connect(audioContext.destination);
+
+        log("Microphone started successfully (AudioWorkletNode)");
+      } catch (err) {
+        console.error(err);
+        alert("Microphone access denied or not supported");
+      }
+    }
+
+    // ==================== HTML ====================
+    const logEl = document.getElementById('log');
+    const MAX_HISTORY_LENGTH = 24;
+    let HISTORY = [];
+
+    function consoleLog(msg) {
+      const time = new Date().toLocaleTimeString();
+      console.log(`[${time}] ${msg}`);
+    }
+
+    function log(msg) {
+      const time = new Date().toLocaleTimeString();
+      HISTORY.push(`<div>[${time}] ${msg}</div>`);
+      if (HISTORY.length > MAX_HISTORY_LENGTH) {
+        HISTORY = HISTORY.slice(-MAX_HISTORY_LENGTH);
+      }
+      logEl.innerHTML = HISTORY.join('');
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    document.getElementById('startBtn').addEventListener('click', async () => {
+      document.getElementById('startBtn').disabled = true;
+      await initPipeline();
+      await startListening();
+    });
+  </script>
+</body>
+</html>

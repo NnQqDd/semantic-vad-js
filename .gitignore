@@ -1,0 +1,2 @@
+*.onnx
+!silero-vad.onnx
