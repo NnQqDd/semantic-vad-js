@@ -1,6 +1,15 @@
 export function makeCallable(instance) {
   const fn = (...x) => instance.call(...x);
-  return fn;
+
+  return new Proxy(fn, {
+    get(_, prop) {
+      return instance[prop];
+    },
+    set(_, prop, value) {
+      instance[prop] = value;
+      return true;
+    }
+  });
 }
 
 
@@ -229,7 +238,7 @@ export function withMask(waveform, maxLength=128000, paddingValue=0.0){
   if (paddingValue !== 0.0) {
     padWave.fill(paddingValue);
   }
-  padWave.set(waveform.slice(0, realSamples), 0);
+  padWave.set(waveform.subarray(0, realSamples), 0);
 
   const attMask = new Uint8Array(maxLength);
   for (let i = 0; i < realSamples; i++) {
@@ -387,6 +396,13 @@ export class SileroVADStream{
     return results;
   }
 
+  reset(){
+    this.state = new ort.Tensor(
+      "float32",
+      new Float32Array(2 * 1 * 128),
+      [2, 1, 128]
+    );
+  }
 }
 
 
@@ -454,7 +470,7 @@ export class SmartTurnV3{
     if(waveform.length === 0){
       return 0.0;
     }
-
+    
     waveform = SmartTurnV3.lastSamplesPadLeft(waveform, this.maxLength);
     waveform = zeroMeanUnitVarNorm([waveform])[0];
 
@@ -468,4 +484,6 @@ export class SmartTurnV3{
 
     return out.data[0];
   }
+
+
 }

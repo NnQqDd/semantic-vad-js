@@ -13,6 +13,7 @@
 </head>
 <body>
   <h1>Semantic VAD Demo</h1>
+  <h4>Time is measured from the moment speech stops</h4>
   <button id="startBtn">Start Listening</button>
   <div id="log"></div>
   <script type="module">
@@ -21,15 +22,16 @@
 
     const SAMPLE_RATE = 16000;
     const CHUNK_SAMPLES = 2048;
-    const MIN_ACTIVE_FRAMES = 2; // Half a chunk, a frame is 512 samples.
+    const MIN_ACTIVE_FRAMES = 1; // A frame is 512 samples.
     const MIN_ACTIVE_CHUNKS = 2;
     const MAX_SILENCE_CHUNKS = 8;
     const MAX_BUFFER_SAMPLES = 128000 + 1024; // 63 chunks
 
+
     let STREAM_VAD = null;
     let SEMANTIC_VAD = null;
     let APPLIED = false;
-
+    let START = null;
     let AUDIO_SAMPLES = new Float32Array(0);
     let CHUNK_ACTIVES = []; // EACH ELEMENT IS VAD OF A CHUNK - 1 or 0, 1 if ACTIVE_SAMPLES >= MIN_ACTIVE_SAMPLES
 
@@ -42,6 +44,10 @@
     // ==================== MAIN AUDIO CALLBACK ====================
     // Called on the main thread whenever the worklet posts a buffer of samples.
     async function audioProcess(newSamples) {
+      if(START === null){
+        START = performance.now();
+      }
+
       let currentSamples = new Float32Array(AUDIO_SAMPLES.length + newSamples.length);
       currentSamples.set(AUDIO_SAMPLES, 0);
       currentSamples.set(newSamples, AUDIO_SAMPLES.length);
@@ -58,10 +64,10 @@
       if (CHUNK_ACTIVES.length > Math.round(MAX_BUFFER_SAMPLES/CHUNK_SAMPLES)){
         CHUNK_ACTIVES.shift();
       }
-      active = CHUNK_ACTIVES.reduce((acc, val) => acc + val, 0);
+      active = CHUNK_ACTIVES.reduce((acc, val) => acc + val, 0); 
+
       /* 
         Run Semantic-VAD when ALL conditions below are satisfied:
-
         1) The number of active chunks ≥ MIN_ACTIVE_CHUNKS
         2) Either:
            - The current chunk is inactive, OR
@@ -71,33 +77,35 @@
         Notes:
         - Currently, only the first condition in (2) is implemented (the current chunk must be inactive).
         - Otherwise, continue accumulating audio until the maximum silence threshold is reached, then force the turn to end.
-      */ 
+      */
+
+      if(CHUNK_ACTIVES[CHUNK_ACTIVES.length - 1]){
+        START = performance.now();
+        APPLIED = false;
+        log(`Still speaking, waiting...`);
+        return;
+      } 
+
       if(active < MIN_ACTIVE_CHUNKS){
         log(`Not enough active chunks - ${active}/${MIN_ACTIVE_CHUNKS}.`);
         return;
       }
 
-      if(CHUNK_ACTIVES[-1]){
-        APPLIED = false;
-      } 
-
-      let silence_chunks = 0;
+      let silenceChunks = 0;
       for(let i = CHUNK_ACTIVES.length - 1; i >= 0; i--){
         if(CHUNK_ACTIVES[i] == 1){
           break;
         }
-        silence_chunks += 1;
+        silenceChunks += 1;
       }
-      
-      if(silence_chunks == 0){
-        log(`Still speaking, waiting...`);
-        return;
-      }
-      if(silence_chunks > MAX_SILENCE_CHUNKS){
+      if(silenceChunks > MAX_SILENCE_CHUNKS){
         AUDIO_SAMPLES = new Float32Array(0);
         CHUNK_ACTIVES = [];
-        consoleLog("End of turn detected by silence.");
-        log("End of turn detected by silence.");
+        APPLIED = false;
+        STREAM_VAD.reset();
+        consoleLog(`End of turn detected by silence (${(MAX_SILENCE_CHUNKS*CHUNK_SAMPLES/SAMPLE_RATE*1000).toFixed(0)}ms)`);
+        log(`End of turn detected by silence (${(MAX_SILENCE_CHUNKS*CHUNK_SAMPLES/SAMPLE_RATE*1000).toFixed(0)}ms)`);
+        return;
       }
 
       if(!APPLIED){
@@ -106,12 +114,13 @@
         if(prob > 0.5){
           AUDIO_SAMPLES = new Float32Array(0);
           CHUNK_ACTIVES = [];
-          consoleLog(`End of turn detected with probability=${prob.toFixed(4)}.`);
-          log(`End of turn detected with probability=${prob.toFixed(4)}.`);
+          APPLIED = false;
+          STREAM_VAD.reset();
+          consoleLog(`End of turn detected with probability=${prob.toFixed(4)} in ${(performance.now() - START).toFixed(0)}ms.`);
+          log(`End of turn detected with probability=${prob.toFixed(4)} in ${(performance.now() - START).toFixed(0)}ms.`);
         }
         else{
           log(`Not end of turn, probability=${prob.toFixed(4)}.`);
-          console.log(AUDIO_SAMPLES);
         }
       }
     }
@@ -200,7 +209,7 @@
         source.connect(workletNode);
         workletNode.connect(audioContext.destination);
 
-        log("Microphone started successfully (AudioWorkletNode)");
+        log("Microphone started successfully");
       } catch (err) {
         console.error(err);
         alert("Microphone access denied or not supported");
