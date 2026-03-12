@@ -21,11 +21,11 @@
     import {SileroVADStream, SmartTurnV3} from './js/package.js';
 
     const SAMPLE_RATE = 16000;
-    const CHUNK_SAMPLES = 2048;
+    const CHUNK_SAMPLES = 1536;
     const MIN_ACTIVE_FRAMES = 1; // A frame is 512 samples.
     const MIN_ACTIVE_CHUNKS = 2;
     const MAX_SILENCE_CHUNKS = 8;
-    const MAX_BUFFER_SAMPLES = 128000 + 1024; // 63 chunks
+    const MAX_BUFFER_SAMPLES = 64000;
 
 
     let STREAM_VAD = null;
@@ -38,7 +38,7 @@
     // ==================== LOAD MODEL ====================
     async function initPipeline() {
       STREAM_VAD = await SileroVADStream.fromFile("./models/silero-vad.onnx");
-      SEMANTIC_VAD = await SmartTurnV3.fromFile("./models/ba887ecc-b2a4-4da6-9bd1-8e7fa3f1124e_merged.onnx", "./models/whisper-short");
+      SEMANTIC_VAD = await SmartTurnV3.fromFile("./models/f11e40ed-0dfd-4b0b-875f-d8ba57caefe0_merged.onnx", "./models/nano-2");
     }
 
     // ==================== MAIN AUDIO CALLBACK ====================

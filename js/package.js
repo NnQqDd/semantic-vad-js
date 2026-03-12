@@ -422,7 +422,8 @@ export class SmartTurnV3{
     instance.maxLength = config.n_samples;
     instance.model = makeCallable(model);
     instance.preprocessor = await AutoProcessor.from_pretrained(configDir);
-    instance.shapes = [1, config.feature_size, config.nb_max_frames]
+    instance.shapes = [1, config.feature_size, config.nb_max_frames];
+    console.log()
     return makeCallable(instance);
   }
 
@@ -475,11 +476,13 @@ export class SmartTurnV3{
     waveform = zeroMeanUnitVarNorm([waveform])[0];
 
     let {input_features, _} = await this.preprocessor(waveform);
+    
     let spec = new ort.Tensor(
       "float32",
       input_features.data,
       this.shapes
     );
+
     let out = await this.model(spec);
 
     return out.data[0];
