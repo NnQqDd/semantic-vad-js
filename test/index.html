@@ -46,11 +46,11 @@ async function test_3(){
 async function test_4() {
     // Load model
     const smartTurn = await SmartTurnV3.fromFile(
-        '../models/smart-turn-v3.2-cpu.onnx',
-        '../models/whisper-pad-right'
+        '../models/ba887ecc-b2a4-4da6-9bd1-8e7fa3f1124e_merged.onnx',
+        '../models/whisper-short',
     );
     const sr = 16000;
-    const duration = 8;
+    const duration = 4;
     const length = sr * duration;
 
     const waveform = new Float32Array(length);

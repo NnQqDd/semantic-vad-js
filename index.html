@@ -38,7 +38,7 @@
     // ==================== LOAD MODEL ====================
     async function initPipeline() {
       STREAM_VAD = await SileroVADStream.fromFile("./models/silero-vad.onnx");
-      SEMANTIC_VAD = await SmartTurnV3.fromFile("./models/smart-turn-v3.2-cpu.onnx", "./models/whisper-pad-right");
+      SEMANTIC_VAD = await SmartTurnV3.fromFile("./models/ba887ecc-b2a4-4da6-9bd1-8e7fa3f1124e_merged.onnx", "./models/whisper-short");
     }
 
     // ==================== MAIN AUDIO CALLBACK ====================
